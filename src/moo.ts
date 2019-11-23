@@ -1,0 +1,228 @@
+import { Core } from "./core.js";
+import { Logger } from "./lib.js";
+import { WSTransport } from "./transport-websocket.js";
+
+export class Moo {
+
+    private _counter = 0;
+    private reqid = 0;
+    private subkey = 0;
+    private requests: any[] = [];
+
+    public logger: Logger;
+    public core: Core | undefined;
+    public mooid: number;
+
+
+    public transport: WSTransport;
+
+    constructor(transport: WSTransport) {
+        this.transport = transport;
+        this.transport.moo = this;
+        this.reqid = 0;
+        this.subkey = 0;
+        this.mooid = this._counter++;
+        this.logger = transport.logger;
+    }
+
+    public _subscribe_helper(svcname: string, reqname: string, cb: (res: boolean | string, body: string) => void): { unsubscribe: (ucb: any) => void }
+    public _subscribe_helper(svcname: string, reqname: string, subscription_args: any, cb: (res: boolean | string, body: string) => void): { unsubscribe: (ucb: any) => void }
+    public _subscribe_helper(svcname: string, reqname: string, argsOrCB: (res: string, body: string) => void | any, cb?: (res: boolean | string, body: string) => void): { unsubscribe: (ucb: any) => void } {
+        var subscription_args: any = {};
+        if (arguments.length == 4) {
+            cb = arguments[3];
+            subscription_args = arguments[2];
+        }
+        // var self = this;
+        var subkey = this.subkey++;
+        subscription_args.subscription_key = subkey;
+        this.send_request(svcname + "/subscribe_" + reqname, subscription_args,
+            (msg: { name: string }, body: string) => {
+                if (cb)
+                    cb(msg && msg.name == "Success" ? false : (msg ? msg.name : "NetworkError"), body);
+            });
+        return {
+            unsubscribe: (ucb) => {
+                this.send_request(svcname + "/unsubscribe_" + reqname,
+                    { subscription_key: subkey },
+                    ucb);
+            }
+        };
+    };
+
+    send_request(...args: any[]) {
+        var name = args[0];
+        var body = args.length > 2 ? args[1] : null;
+        var content_type = args.length > 3 ? args[2] : null;
+        var cb = args[args.length - 1];
+
+        // name = args[0];
+        // if (typeof (args[1]) != 'function') { body = args[1]; } else { cb = args[1] }
+        // if (typeof (args[2]) != 'function') { content_type = args[2]; }
+        // cb = args[i++];
+
+        var origbody = body;
+
+        if (typeof (body) == 'undefined') {
+            // nothing needed here
+        } else if (!Buffer.isBuffer(body)) {
+            body = Buffer.from(JSON.stringify(body), 'utf8');
+            content_type = content_type || "application/json";
+        } else {
+            throw new Error("missing content_type");
+        }
+
+        let header = 'MOO/1 REQUEST ' + name + '\n' +
+            'Request-Id: ' + this.reqid + '\n';
+
+        if (body) {
+            header += 'Content-Length: ' + body.length + '\n' +
+                'Content-Type: ' + content_type + '\n';
+        }
+
+        this.logger.log('-> REQUEST', this.reqid, name, origbody ? JSON.stringify(origbody) : "");
+        const m = Buffer.from(header + '\n');
+        if (body)
+            this.transport.send(Buffer.concat([m, body], m.length + body.length));
+        else
+            this.transport.send(m);
+
+        this.requests[this.reqid] = { cb: cb };
+        this.reqid++;
+    };
+
+    parse(buf: any) {
+        var e = 0;
+        var s = 0;
+        var msg: any = {
+            headers: {}
+        };
+
+        if ((typeof ArrayBuffer != 'undefined') && (buf instanceof (ArrayBuffer))) {
+            // convert to Node Buffer
+            var view = new Uint8Array(buf);
+            buf = Buffer.alloc(buf.byteLength);
+            for (var i = 0; i < buf.length; ++i) buf[i] = view[i];
+        }
+
+        if (buf.length == 0) {
+            this.logger.log("MOO: empty message received");
+            return undefined;
+        }
+
+        var state;
+        while (e < buf.length) {
+            if (buf[e] == 0xa) { // looking to parse lines -- s == start of line, e == end of line
+                // parsing headers or first line?
+                if (state == 'header') {
+                    if (s == e) { // is blank line? blank line is end of headers
+                        // end of MOO header
+                        if (msg.request_id === undefined) {
+                            this.logger.log('MOO: missing Request-Id header: ', msg);
+                            return undefined;
+                        }
+                        if (msg.content_length === undefined) {
+                            if (msg.content_type) {
+                                this.logger.log("MOO: bad message; has Content-Type but not Content-Length: ", msg);
+                                return undefined;
+                            }
+                            if (e != buf.length - 1) {
+                                this.logger.log("MOO: bad message; has no Content-Length, but data after headers: ", msg);
+                                return undefined;
+                            }
+
+                        } else {
+                            if (msg.content_length > 0) {
+                                if (!msg.content_type) {
+                                    this.logger.log("MOO: bad message; has Content-Length but not Content-Type: ", msg);
+                                    return undefined;
+                                } else if (msg.content_type == "application/json") {
+                                    var json = buf.toString('utf8', e + 1, e + 1 + msg.content_length);
+                                    try {
+
+                                        console.log("moo:143");
+                                        console.log(json);
+
+                                        msg.body = JSON.stringify(json);
+                                    } catch (e) {
+                                        this.logger.log("MOO: bad json body: ", json, msg);
+                                        return undefined;
+                                    }
+                                } else {
+                                    msg.body = buf.slice(e + 1, e + 1 + msg.content_length);
+                                }
+                            }
+                        }
+                        return msg;
+                    } else {
+                        // parse MOO header line
+                        var line = buf.toString('utf8', s, e);
+                        var matches = line.match(/([^:]+): *(.*)/);
+                        if (matches) {
+                            if (matches[1] == "Content-Type")
+                                msg.content_type = matches[2];
+                            else if (matches[1] == "Content-Length")
+                                msg.content_length = parseInt(matches[2]);
+                            else if (matches[1] == "Request-Id")
+                                msg.request_id = matches[2];
+                            else
+                                msg.headers[matches[1]] = matches[2];
+                        } else {
+                            this.logger.log("MOO: bad header line: ", line, msg);
+                            return undefined;
+                        }
+                    }
+                } else {
+                    // parse MOO first line
+                    var line = buf.toString('utf8', s, e);
+                    var matches = line.match(/^MOO\/([0-9]+) ([A-Z]+) (.*)/);
+                    if (matches) {
+                        msg.verb = matches[2];
+                        if (msg.verb == "REQUEST") {
+                            matches = matches[3].match(/([^\/]+)\/(.*)/);
+                            if (matches) {
+                                msg.service = matches[1];
+                                msg.name = matches[2];
+                            } else {
+                                this.logger.log("MOO: bad first line: ", line, msg);
+                                return undefined;
+                            }
+                        } else {
+                            msg.name = matches[3];
+                        }
+                        state = 'header';
+                    } else {
+                        this.logger.log("MOO: bad first line: ", line, msg);
+                        return undefined;
+                    }
+                }
+                s = e + 1;
+            }
+            e++;
+        }
+        this.logger.log("MOO: message lacks newline in header");
+        return undefined;
+    };
+
+
+    handle_response(msg: any, body: string) {
+        let req = this.requests[msg.request_id];
+        if (!req) {
+            this.logger.log("MOO: can not handle RESPONSE due to unknown Request-Id: ", msg);
+            return false;
+        }
+        if (req.cb) req.cb(msg, body);
+        if (msg.verb == "COMPLETE") delete (this.requests[msg.request_id]);
+        return true;
+    };
+
+    clean_up() {
+        this.requests.forEach(e => {
+            let cb = e.cb;
+            if (cb) cb();
+        });
+        this.requests = [];
+    };
+
+
+}
